@@ -1,0 +1,23 @@
+# Render blueprint — free tier web service (750 hrs/month, spins down when idle).
+# Deploy: push this repo to GitHub, then in Render: New -> Blueprint -> select repo.
+# Render auto-detects this file and creates the service. No card required for free tier.
+services:
+  - type: web
+    name: switchboard
+    runtime: docker
+    plan: free
+    healthCheckPath: /healthz
+    envVars:
+      # Render injects PORT automatically; the server reads it from the environment.
+      - key: HOST
+        value: "0.0.0.0"
+      - key: PLATFORM_FEE_PCT
+        value: "5"
+      # Optional later — Stripe test keys for real $1/mo billing:
+      # - key: STRIPE_SECRET_KEY
+      #   sync: false
+      # - key: STRIPE_PRICE_ID
+      #   sync: false
+# NOTE: Render free tier has an ephemeral filesystem — the SQLite DB resets on
+# each deploy/restart. Fine for the demo; add Render Disk ($, paid) or move to
+# Fly.io with a volume when persistence matters.

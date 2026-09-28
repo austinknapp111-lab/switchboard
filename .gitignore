@@ -1,0 +1,11 @@
+*.db
+*.db-wal
+*.db-shm
+.admin_token
+seed_bots/
+backups/
+logs/
+__pycache__/
+*.pyc
+.env
+.DS_Store

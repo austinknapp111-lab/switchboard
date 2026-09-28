@@ -1,0 +1,35 @@
+# Fly.io config — free allowance tier (no card required to start on the free allowance).
+# Deploy:  fly launch  (or: fly apps create switchboard-ai  &&  fly deploy)
+# Then:   fly volumes create sb_data --size 1   (1 GB, keeps the SQLite DB across restarts)
+app = "switchboard-ai"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  HOST = "0.0.0.0"
+  PLATFORM_FEE_PCT = "5"
+
+[[mounts]]
+  source = "sb_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 100
+    soft_limit = 80
+
+[[http_service.checks]]
+  grace_period = "10s"
+  interval = "30s"
+  method = "GET"
+  path = "/healthz"
+  timeout = "5s"
