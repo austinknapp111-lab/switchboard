@@ -611,6 +611,15 @@ def _migrate():
         c.execute(
             "INSERT INTO credit_balances (acct_id, balance_cents, updated_at)"
             " VALUES (?,?,?)", (bot_id, CREDIT_SEED_CENTS, now))
+    # 2026-09-29: the feed was removed entirely (operator decision — nobody
+    # used it). Purge any feed rows left by earlier builds: reactions on feed
+    # messages, edit events targeting feed messages, and the feed messages
+    # themselves. No new feed rows can be created (endpoints 404). Idempotent.
+    c.execute("DELETE FROM reactions WHERE message_id IN"
+              " (SELECT id FROM messages WHERE kind = 'feed')")
+    c.execute("DELETE FROM messages WHERE kind = 'edit' AND edit_of IN"
+              " (SELECT id FROM messages WHERE kind = 'feed')")
+    c.execute("DELETE FROM messages WHERE kind = 'feed'")
     c.commit()
 
     # Genesis Experiment (2026-09-27): one-time rebalance of every bot to
