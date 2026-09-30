@@ -3,10 +3,11 @@
 
 Spins up a throwaway server with a temp SQLite DB, then proves over HTTP:
 
-  hide message -> excluded from room + global/following/bot feed + DM reads,
+  hide message -> tombstone in room reads (no body/signature/bot identity),
+    excluded from DM reads,
     but hash chains still verify (rows are flagged, never deleted)
   unhide -> message visible again
-  suspend bot -> 403 "account suspended" on room post, feed post, DM, listing
+  suspend bot -> 403 "account suspended" on room post, DM, listing
   unsuspend -> posting works again
   bad admin token -> 404 on all moderation endpoints (same as other admin routes)
   unknown message id / bot id -> 404
@@ -66,6 +67,16 @@ def auth(bot):
     return {"X-Bot-Id": bot["bot_id"], "X-Api-Secret": bot["secret"]}
 
 
+def get_html(path):
+    """Raw HTML fetch (no auth) — /moderation is a public page."""
+    r = urllib.request.Request(BASE + path, method="GET")
+    try:
+        with urllib.request.urlopen(r, timeout=15) as resp:
+            return resp.status, resp.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
+
 ADM = {"X-Admin-Token": ADMIN}
 BAD_ADM = {"X-Admin-Token": "wrong-token"}
 
@@ -94,14 +105,6 @@ def post_room(bot, room, body):
     return req("POST", "/api/v1/messages",
                {"room": room, "body": body, "timestamp": ts,
                 "signature": esign(bot, server.canonical_room(room, body, ts))},
-               auth(bot))
-
-
-def post_feed(bot, body):
-    ts = now_ts()
-    return req("POST", "/api/v1/feed",
-               {"body": body, "timestamp": ts,
-                "signature": esign(bot, server.canonical_feed(body, ts))},
                auth(bot))
 
 
@@ -161,9 +164,9 @@ def main():
         room_msg = r["id"]
         c, r = post_room(A, "general", "second visible message")
         check("A second room post -> 201", c == 201, f"{c} {r}")
-        c, r = post_feed(A, "A public feed update")
-        check("A feed post -> 201", c == 201, f"{c} {r}")
-        feed_msg = r["id"]
+        c, r = post_room(A, "general", "A third visible message")
+        check("A third room post -> 201", c == 201, f"{c} {r}")
+        third_msg = r["id"]
         c, r = post_dm(A, B["bot_id"], "secret hello")
         check("A DM to B -> 201", c == 201, f"{c} {r}")
         dm_msg = r["id"]
@@ -174,15 +177,21 @@ def main():
         check("admin hide room msg -> 200 hidden=true", c == 200
               and r.get("hidden") is True, f"{c} {r}")
         c, r = req("GET", "/api/v1/messages?room=general")
-        check("hidden msg excluded from room read",
-              c == 200 and len(r["messages"]) == 1
-              and r["messages"][0]["body"] == "second visible message",
-              str(r)[:200])
+        msgs = r["messages"]
+        tombs = [m for m in msgs if m.get("kind") == "tombstone"]
+        check("hidden msg surfaces as tombstone in room read (no body/signature/bot)",
+              c == 200 and len(msgs) == 3 and len(tombs) == 1
+              and tombs[0]["tombstone_for"] == "room"
+              and tombs[0]["hidden"] == 1 and tombs[0]["id"] == room_msg
+              and "body" not in tombs[0] and "signature" not in tombs[0]
+              and "bot_id" not in tombs[0] and "bot_name" not in tombs[0]
+              and msgs[1]["body"] == "second visible message",
+              str(r)[:300])
         # chain still intact: rows are flagged, not deleted
         c, r = req("GET", "/api/v1/chain/verify?room=general")
         ch = (r.get("chains") or [{}])[0]
-        check("room chain verifies with hidden msg present (messages=2)",
-              c == 200 and r.get("ok") is True and ch.get("messages") == 2,
+        check("room chain verifies with hidden msg present (messages=3)",
+              c == 200 and r.get("ok") is True and ch.get("messages") == 3,
               str(ch))
         # -- unhide restores ------------------------------------
         c, r = req("POST", f"/api/v1/admin/messages/{room_msg}/unhide", {}, ADM)
@@ -190,27 +199,23 @@ def main():
               and r.get("hidden") is False, f"{c} {r}")
         c, r = req("GET", "/api/v1/messages?room=general")
         check("unhidden msg back in room read", c == 200
-              and len(r["messages"]) == 2, str(r)[:200])
+              and len(r["messages"]) == 3, str(r)[:200])
 
-        # -- hide: feed reads -----------------------------------
-        c, _ = req("POST", f"/api/v1/admin/messages/{feed_msg}/hide",
+        # -- hide: third room message -> tombstone ---------------
+        c, _ = req("POST", f"/api/v1/admin/messages/{third_msg}/hide",
                    {"reason": "test"}, ADM)
-        check("hide feed post -> 200", c == 200, str(c))
-        c, r = req("GET", "/api/v1/feed?scope=global")
-        check("hidden post excluded from global feed", c == 200
-              and len(r["posts"]) == 0, str(r)[:200])
-        c, r = req("GET", "/api/v1/feed?scope=bot&bot_id=" + A["bot_id"])
-        check("hidden post excluded from bot feed", c == 200
-              and len(r["posts"]) == 0, str(r)[:200])
-        req("POST", "/api/v1/follows", {"followee_id": A["bot_id"]}, auth(B))
-        c, r = req("GET", "/api/v1/feed?scope=following", None, auth(B))
-        check("hidden post excluded from following feed", c == 200
-              and len(r["posts"]) == 0, str(r)[:200])
-        c, _ = req("POST", f"/api/v1/admin/messages/{feed_msg}/unhide", {}, ADM)
-        check("unhide feed post -> 200", c == 200, str(c))
-        c, r = req("GET", "/api/v1/feed?scope=global")
-        check("feed post visible again", c == 200 and len(r["posts"]) == 1,
+        check("hide room post -> 200", c == 200, str(c))
+        c, r = req("GET", "/api/v1/messages?room=general")
+        tombs = [m for m in r["messages"] if m.get("kind") == "tombstone"]
+        check("hidden post surfaces as tombstone", c == 200
+              and len(tombs) == 1 and tombs[0]["id"] == third_msg,
               str(r)[:200])
+        c, _ = req("POST", f"/api/v1/admin/messages/{third_msg}/unhide", {}, ADM)
+        check("unhide room post -> 200", c == 200, str(c))
+        c, r = req("GET", "/api/v1/messages?room=general")
+        check("room post visible again", c == 200
+              and any(m.get("body") == "A third visible message"
+                      for m in r["messages"]), str(r)[:200])
 
         # -- hide: DM read --------------------------------------
         c, _ = req("POST", f"/api/v1/admin/messages/{dm_msg}/hide",
@@ -235,9 +240,6 @@ def main():
         c, r = post_room(A, "general", "should not post")
         check("suspended room post -> 403 account suspended",
               c == 403 and r.get("error") == "account suspended", f"{c} {r}")
-        c, r = post_feed(A, "should not post")
-        check("suspended feed post -> 403", c == 403
-              and r.get("error") == "account suspended", f"{c} {r}")
         c, r = post_dm(A, B["bot_id"], "should not send")
         check("suspended DM -> 403", c == 403
               and r.get("error") == "account suspended", f"{c} {r}")
@@ -248,7 +250,7 @@ def main():
         # reading still works while suspended
         c, r = req("GET", "/api/v1/messages?room=general")
         check("suspended bot's reads unaffected", c == 200
-              and len(r["messages"]) == 2, str(c))
+              and len(r["messages"]) == 3, str(c))
         # -- unsuspend restores ---------------------------------
         c, r = req("POST", f"/api/v1/admin/bots/{A['bot_id']}/unsuspend", {}, ADM)
         check("admin unsuspend -> 200", c == 200
@@ -288,8 +290,8 @@ def main():
         check("mod-log newest first (unsuspend last)",
               kinds[0] == "unsuspend" and kinds[-1] == "hide",
               str(kinds))
-        check("mod-log actors all 'moderator'",
-              all(a["actor"] == "moderator" for a in acts), str(kinds))
+        check("mod-log actors all 'admin' (token actions)",
+              all(a["actor"] == "admin" for a in acts), str(kinds))
         check("mod-log reasons preserved",
               any(a["action"] == "suspend"
                   and a["reason"] == "test suspension"
@@ -300,6 +302,29 @@ def main():
         check("mod-log limit=2 -> 2 newest", c == 200
               and len(r["actions"]) == 2
               and r["actions"][0]["action"] == "unsuspend", str(r)[:200])
+
+        # -- public mod-log page ---------------------------------
+        c, html = get_html("/moderation")
+        check("GET /moderation -> 200 public (no auth)", c == 200, str(c))
+        check("mod page shows reasons + actor",
+              "Moderation log" in html
+              and "test suspension" in html
+              and "admin" in html, html[:200])
+        check("mod page links affected bot profile",
+              f'/bot/{A["bot_id"]}' in html, str(c))
+        check("mod page reachable from /bots sidebar",
+              '/moderation' in get_html("/bots")[1], "no sidebar link")
+        # hide a message, verify page shows the action but NEVER the body
+        c, _ = req("POST", f"/api/v1/admin/messages/{third_msg}/hide",
+                   {"reason": "mod-page-marker-xyz"}, ADM)
+        check("hide for page test -> 200", c == 200, str(c))
+        c, html = get_html("/moderation")
+        check("mod page shows hide action with reason",
+              c == 200 and "mod-page-marker-xyz" in html, str(c))
+        check("mod page never renders hidden message bodies",
+              "A third visible message" not in html, html[:400])
+        c, _ = req("POST", f"/api/v1/admin/messages/{third_msg}/unhide", {}, ADM)
+        check("unhide after page test -> 200", c == 200, str(c))
     finally:
         proc.terminate()
         try:

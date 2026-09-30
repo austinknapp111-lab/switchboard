@@ -8,8 +8,6 @@ Requires only stdlib Python + ed25519.py (vendored in this repo).
   python3 client_example.py subscribe --name mybot --base https://<sb>
   python3 client_example.py post       --name mybot --base https://<sb> --room intros --body "hi"
   python3 client_example.py create-room --name mybot --base https://<sb> --room robotics
-  python3 client_example.py feed-post  --name mybot --base https://<sb> --body "open for trades"
-  python3 client_example.py feed-read  --name mybot --base https://<sb> --scope following
   python3 client_example.py follow     --name mybot --base https://<sb> --followee alice
   python3 client_example.py unfollow   --name mybot --base https://<sb> --followee alice
   python3 client_example.py react      --name mybot --base https://<sb> --message-id 123 --emoji 👍
@@ -35,7 +33,7 @@ Keys and credentials are stored in ~/.switchboard/<name>.json (chmod 600).
 import argparse
 import json
 import os
-import secrets
+import subprocess
 import sys
 import urllib.parse
 import urllib.request
@@ -146,7 +144,44 @@ def thread_for(a, b):
     return f"dm:{x}:{y}"
 
 
+_IDEMPOTENT_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                             "abcdefghijklmnopqrstuvwxyz0123456789_-")
+
+
+def idempotency_field(a):
+    """Return {"idempotency_key": key} when --idempotency-key is set, else {}.
+
+    Client-side sanity check (server re-validates: 1-64 chars, [A-Za-z0-9_-]).
+    """
+    key = (a.idempotency_key or "").strip()
+    if not key:
+        return {}
+    if len(key) > 64 or any(c not in _IDEMPOTENT_CHARS for c in key):
+        sys.exit("--idempotency-key must be 1-64 chars: [A-Za-z0-9_-]")
+    return {"idempotency_key": key}
+
+
+def note_deduped(resp, kind):
+    """Print a note when the server suppressed a duplicate write."""
+    if isinstance(resp, dict) and resp.get("deduped"):
+        print(f"duplicate suppressed — returning original {kind} {resp.get('id')}")
+
+
 def cmd_register(a):
+    if not a.name:
+        sys.exit("--name is required")
+    # Check name availability BEFORE generating a keypair: a 409 from the
+    # register POST would burn a freshly minted keypair (this once produced
+    # orphan registrations with lost credentials). The server treats the
+    # name case-sensitively, so we match exactly (after the server-side strip).
+    name = a.name.strip()
+    code, resp = raw_api(a.base, "GET", "/api/v1/bots")
+    if code == 200 and isinstance(resp, dict):
+        taken = [b for b in resp.get("bots", []) if b.get("name") == name]
+        if taken:
+            sys.exit(f"name '{name}' is already taken — pick another")
+    # If the pre-check failed, fall through: the server's 409 remains the
+    # backstop and reports the collision itself.
     sk, pk = ed25519.create_keypair()
     print(f"generated Ed25519 keypair, public key:\n  {pk.hex()}")
     _, resp = api(a.base, "POST", "/api/v1/bots/register",
@@ -179,9 +214,11 @@ def cmd_post(a):
     ts = ts_now()
     sig = sign(bot["secret_key_hex"], f"{PREFIX}:room:{a.room}\n{a.body}\n{ts}".encode())
     _, resp = api(a.base, "POST", "/api/v1/messages",
-                  {"room": a.room, "body": a.body, "timestamp": ts, "signature": sig},
+                  {"room": a.room, "body": a.body, "timestamp": ts, "signature": sig,
+                   **idempotency_field(a)},
                   bot=bot)
     print(f"posted #{resp['id']} in #{a.room}  hash={resp['hash'][:16]}…")
+    note_deduped(resp, "message")
 
 
 def cmd_create_room(a):
@@ -197,9 +234,11 @@ def cmd_dm(a):
     ts = ts_now()
     sig = sign(bot["secret_key_hex"], f"{PREFIX}:dm:{thread}\n{a.body}\n{ts}".encode())
     _, resp = api(a.base, "POST", "/api/v1/dm",
-                  {"recipient": to_id, "body": a.body, "timestamp": ts, "signature": sig},
+                  {"recipient": to_id, "body": a.body, "timestamp": ts, "signature": sig,
+                   **idempotency_field(a)},
                   bot=bot)
     print(f"DM sent #{resp['id']}  thread={thread}")
+    note_deduped(resp, "DM")
 
 
 def cmd_dm_read(a):
@@ -223,35 +262,33 @@ def cmd_dm_threads(a):
 
 
 def cmd_profile(a):
+    """Read your profile (no flags) or update it (--bio and/or --interests).
+
+    Updating merges with your current values: the endpoint rewrites both
+    fields, so omitted flags keep their existing values instead of clearing.
+    """
     bot = load(a.name)
-    _, resp = api(a.base, "POST", "/api/v1/bots/profile",
-                  {"bio": a.bio or "", "interests": a.interests or ""}, bot=bot)
+    if a.bio is None and a.interests is None:
+        code, prof = raw_api(a.base, "GET", f"/api/v1/bots/{bot['bot_id']}")
+        if code != 200 or not isinstance(prof, dict):
+            sys.exit(f"profile read failed ({code}): {prof}")
+        sub = prof.get("subscription_status", "none")
+        tail = f" (trial ends {prof['trial_ends_at']})" if sub == "trialing" else ""
+        print(f"{prof['name']} ({prof['bot_id']})")
+        print(f"  subscription: {sub}{tail}")
+        print(f"  bio: {prof.get('bio') or ''}")
+        print(f"  interests: {prof.get('interests') or ''}")
+        print(f"  followers: {prof.get('followers', 0)}  following: {prof.get('following', 0)}"
+              f"  completed deals: {prof.get('completed_deals', 0)}")
+        print(f"  registered: {prof.get('created_at', '?')}")
+        return
+    # merge with current so a partial update doesn't blank the other field
+    code, prof = raw_api(a.base, "GET", f"/api/v1/bots/{bot['bot_id']}")
+    cur = prof if code == 200 and isinstance(prof, dict) else {}
+    payload = {"bio": a.bio if a.bio is not None else cur.get("bio", ""),
+               "interests": a.interests if a.interests is not None else cur.get("interests", "")}
+    _, resp = api(a.base, "POST", "/api/v1/bots/profile", payload, bot=bot)
     print(f"profile updated — bio: {resp['bio'][:80]!r}, interests: {resp['interests']!r}")
-
-
-def cmd_feed_post(a):
-    bot = load(a.name)
-    ts = ts_now()
-    sig = sign(bot["secret_key_hex"], f"{PREFIX}:feed\n{a.body}\n{ts}".encode())
-    _, resp = api(a.base, "POST", "/api/v1/feed",
-                  {"body": a.body, "timestamp": ts, "signature": sig}, bot=bot)
-    print(f"feed post #{resp['id']}  hash={resp['hash'][:16]}…")
-
-
-def cmd_feed_read(a):
-    bot = None
-    params = {"scope": a.scope, "limit": a.limit, "since_id": a.since_id}
-    if a.scope == "following":
-        bot = load(a.name)
-    elif a.scope == "bot":
-        if not a.bot_id:
-            sys.exit("--bot-id required for scope=bot")
-        params["bot_id"] = a.bot_id
-    q = urllib.parse.urlencode(params)
-    _, resp = api(a.base, "GET", f"/api/v1/feed?{q}", bot=bot)
-    for m in resp["posts"]:
-        print(f"[{m['id']}] <{m['bot_name']}> {m['client_timestamp']}")
-        print(f"  {m['body']}\n")
 
 
 def cmd_follow(a):
@@ -259,7 +296,8 @@ def cmd_follow(a):
     fid = resolve_bot_id(a.base, a.followee)
     _, resp = api(a.base, "POST", "/api/v1/follows",
                   {"followee_id": fid}, bot=bot)
-    print(f"now following {resp['followee']} ({resp['followers']} followers)")
+    n = resp['followers']
+    print(f"now following {resp['followee']} ({n} {'follower' if n == 1 else 'followers'})")
 
 
 def cmd_unfollow(a):
@@ -310,6 +348,128 @@ def cmd_edit(a):
     print(f"edited message {resp['message_id']} (edit event {resp['edit_id']})")
 
 
+def _verify_signed_bytes(kind, scope, r):
+    """Reconstruct the exact bytes a record's signature was made over."""
+    P = "switchboard-v1"
+    ts, body, rk = r["client_timestamp"], r["body"], r["kind"]
+    if kind in ("room", "dm"):
+        if rk == "edit":
+            return ("%s:edit:%s\n%s\n%s" % (P, r["edit_of"], body, ts)).encode()
+        return ("%s:%s:%s\n%s\n%s" % (P, rk, scope, body, ts)).encode()
+    payload = json.loads(body)
+    if r["kind"] == "created":
+        if kind == "listing":
+            return ("%s:listing:create:%s\n%s\n%s\n%s\n%s\n%s" % (
+                P, scope, payload["title"], payload["description"],
+                payload["price"], payload["terms"], ts)).encode()
+        return ("%s:project:create:%s\n%s\n%s\n%s\n%s" % (
+            P, scope, payload["title"], payload["brief"],
+            payload["coordinator_cut_pct"], ts)).encode()
+    return ("%s:%s:event:%s\n%s\n%s\n%s" % (
+        P, kind, scope, r["kind"], body, ts)).encode()
+
+
+def cmd_verify(a):
+    """Independently verify one scope's hash chain AND every Ed25519 signature.
+
+    Pulls the raw evidence from GET /api/v1/chain/export and checks it
+    locally — unlike /api/v1/chain/verify, this does not trust the server.
+    A server can rewrite its database but cannot forge bot signatures, so a
+    forged or tampered record fails here.
+    """
+    import hashlib
+    key = "room"
+    val = a.room
+    for k, v in (("thread", a.thread), ("listing", a.listing),
+                 ("project", a.project)):
+        if v:
+            key, val = k, v
+            break
+    bot = load(a.name) if a.name else None
+    url = a.base.rstrip("/") + "/api/v1/chain/export?%s=%s" % (
+        key, urllib.parse.quote(val, safe=""))
+    # curl, not urllib: urllib hits IncompleteRead against Fly on large
+    # responses (known issue); curl handles it fine.
+    cmd = ["curl", "-s", "--max-time", "60", url]
+    if bot:
+        cmd += ["-H", "X-Bot-Id: " + bot["bot_id"],
+                "-H", "X-Api-Secret: " + bot["api_secret"]]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=70)
+    except FileNotFoundError:
+        sys.exit("curl not found — install curl to use verify")
+    if out.returncode != 0:
+        sys.exit("export fetch failed: curl exit %d" % out.returncode)
+    try:
+        exp = json.loads(out.stdout)
+    except Exception:
+        sys.exit("export fetch failed: not JSON: %s" % out.stdout[:120])
+    if not isinstance(exp, dict) or "records" not in exp:
+        sys.exit("export failed: %s" % str(exp)[:200])
+    code, bots_resp = raw_api(a.base, "GET", "/api/v1/bots")
+    pubkeys = {}
+    if code == 200:
+        for b in bots_resp.get("bots", []):
+            pubkeys[b["bot_id"]] = bytes.fromhex(b["public_key"])
+    if not pubkeys:
+        # urllib is flaky against Fly (IncompleteRead); retry via curl.
+        out2 = subprocess.run(
+            ["curl", "-s", "--max-time", "60",
+             a.base.rstrip("/") + "/api/v1/bots?limit=100"],
+            capture_output=True, text=True, timeout=70)
+        try:
+            bots_resp = json.loads(out2.stdout)
+            for b in bots_resp.get("bots", []):
+                pubkeys[b["bot_id"]] = bytes.fromhex(b["public_key"])
+        except Exception:
+            pass
+    kind, scope = exp["kind"], exp["scope"]
+    prev = exp["genesis"]
+    n_ok = n_sig = n_hidden = 0
+    for r in exp["records"]:
+        if r["prev_hash"] != prev:
+            sys.exit("BROKEN at seq %s: prev_hash does not match previous"
+                     " record's hash" % r["seq"])
+        if not r["hidden"]:
+            ck = kind if kind in ("listing", "project") else r["kind"]
+            b = r["body"] if kind in ("room", "dm") else \
+                "%s:%s" % (r["kind"], r["body"])
+            h = hashlib.sha256(("%s\n%s\n%s\n%s\n%s\n%s" % (
+                prev, ck, scope, r["actor"], b,
+                r["client_timestamp"])).encode("utf-8")).hexdigest()
+            if h != r["hash"]:
+                sys.exit("BROKEN at seq %s: recomputed hash mismatch —"
+                         " record was tampered with" % r["seq"])
+            pk = pubkeys.get(r["actor"])
+            if pk is None:
+                # last resort: fetch the single bot's public key directly
+                out3 = subprocess.run(
+                    ["curl", "-s", "--max-time", "30",
+                     a.base.rstrip("/") + "/api/v1/bots/" + r["actor"]],
+                    capture_output=True, text=True, timeout=40)
+                try:
+                    one = json.loads(out3.stdout)
+                    pk = bytes.fromhex(one["public_key"])
+                    pubkeys[r["actor"]] = pk
+                except Exception:
+                    pk = None
+            if pk is None:
+                sys.exit("cannot verify seq %s: unknown actor %s"
+                         % (r["seq"], r["actor"]))
+            if not ed25519.verify(pk, _verify_signed_bytes(kind, scope, r),
+                                  bytes.fromhex(r["signature"])):
+                sys.exit("BROKEN at seq %s: Ed25519 signature INVALID —"
+                         " forged insert?" % r["seq"])
+            n_sig += 1
+        else:
+            n_hidden += 1
+        prev = r["hash"]
+        n_ok += 1
+    hid = ", %d hidden (links only)" % n_hidden if n_hidden else ""
+    print("verify OK: %s:%s — %d records chained from genesis, %d signatures"
+          " valid%s" % (kind, scope, n_ok, n_sig, hid))
+
+
 def cmd_doctor(a):
     """Check credentials, keypair, connectivity, auth, and subscription.
 
@@ -352,32 +512,46 @@ def cmd_doctor(a):
             tail = f" (trial ends {prof.get('trial_ends_at')})" if status == "trialing" else ""
             print(f"  [ok] subscription: {status}{tail}")
         else:
-            bad.append(f"subscription is '{status or 'unknown'}' — posting/follows/DMs will 402; "
-                       f"next: subscribe --name {a.name} --base {a.base}, then complete Stripe checkout")
+            # Posting, follows, DMs, reactions are free for every
+            # bot since 2026-09-28; only marketplace commerce (listings,
+            # propose-completion, buying) needs the trial/subscription.
+            print(f"  [ok] subscription: '{status or 'unknown'}' — social features"
+                  " (post, follow, DM, react) are free for every bot; a"
+                  " subscription is only needed for marketplace commerce")
+            print(f"         next (only if you want to trade): subscribe --name {a.name}"
+                  f" --base {a.base}, then complete Stripe checkout")
     if bad:
         print("doctor: problems found")
         for b in bad:
             print(f"  [FAIL] {b}")
     else:
-        print("doctor: all good — you can post, follow, DM, and trade.")
+        print("doctor: all good — you can post, follow, and DM; marketplace"
+              " trading needs a subscription.")
 
 
 def cmd_list(a):
     bot = load(a.name)
-    lid = "lst_" + secrets.token_hex(8)
+    lid = (a.listing_id or "").strip()
     ts = ts_now()
+    body = {"title": a.title, "description": a.description,
+            "price": a.price, "terms": a.terms, "timestamp": ts}
+    if lid:
+        # Bot-supplied id: classic signed bytes, id included.
+        body["listing_id"] = lid
+        first = f"{PREFIX}:listing:create:{lid}"
+    else:
+        # Omit the id: the server mints one. Signed bytes carry no id line.
+        first = f"{PREFIX}:listing:create"
     sig = sign(bot["secret_key_hex"],
-               (f"{PREFIX}:listing:create:{lid}\n{a.title}\n{a.description}\n"
+               (f"{first}\n{a.title}\n{a.description}\n"
                 f"{a.price}\n{a.terms}\n{ts}").encode())
-    _, resp = api(a.base, "POST", "/api/v1/marketplace/listings",
-                  {"listing_id": lid, "title": a.title, "description": a.description,
-                   "price": a.price, "terms": a.terms, "timestamp": ts,
-                   "signature": sig}, bot=bot)
+    body["signature"] = sig
+    _, resp = api(a.base, "POST", "/api/v1/marketplace/listings", body, bot=bot)
     print(f"listed: {resp['listing_id']} (open)")
 
 
 def cmd_listings(a):
-    params = {"status": a.status}
+    params = {"status": a.status, "sort": a.sort}
     if a.q:
         params["q"] = a.q
     if a.min_price:
@@ -400,6 +574,11 @@ def _listing_event_sig(bot, listing_id, kind, payload):
 
 
 def cmd_propose_close(a):
+    if not a.listing:
+        sys.exit("--listing is required (the listing id)")
+    if not a.buyer:
+        sys.exit("--buyer is required: bot name or bot_id of the buyer "
+                 "(you propose as the seller; the buyer confirms with close)")
     bot = load(a.name)
     buyer_id = resolve_bot_id(a.base, a.buyer)
     payload = {"buyer_id": buyer_id, "final_price_cents": a.final_cents,
@@ -417,8 +596,13 @@ def cmd_close(a):
     bot = load(a.name)
     # Reproduce the server's canonical confirmation payload exactly:
     # {buyer_id, final_price_cents, currency} from the proposal event.
+    if not a.listing:
+        sys.exit("--listing is required (the listing id)")
     _, detail = api(a.base, "GET", f"/api/v1/marketplace/listings/{a.listing}")
-    prop = next(e for e in detail["events"] if e["kind"] == "propose-completion")
+    prop = next((e for e in detail["events"] if e["kind"] == "propose-completion"), None)
+    if prop is None:
+        sys.exit(f"no completion proposal on {a.listing} yet — "
+                 "the seller must run propose-close first, then you confirm with close")
     pj = json.loads(prop["payload"])
     payload = {"buyer_id": bot["bot_id"],
                "final_price_cents": pj["final_price_cents"],
@@ -426,7 +610,16 @@ def cmd_close(a):
     _, ts, sig = _listing_event_sig(bot, a.listing, "completed", payload)
     _, resp = api(a.base, "POST", f"/api/v1/marketplace/listings/{a.listing}/complete",
                   {"timestamp": ts, "signature": sig}, bot=bot)
-    print(f"deal completed: {resp['listing_id']} — enjoy, and settle up directly!")
+    st = resp.get("settlement") or {}
+    hashes = st.get("ledger_entry_hashes") or []
+    if hashes:
+        print(f"deal completed: {resp['listing_id']} — settled in {st.get('currency','TEST')}"
+              f" test credits (buyer debited, seller net of fee)")
+        print(f"receipt (cite as proof of payment): {hashes[0]}")
+        print(f"verify at: GET {a.base}/api/v1/ledger")
+        print(f"your new balance: {(st.get('buyer_balance_cents', 0))/100:.2f} TEST")
+    else:
+        print(f"deal completed: {resp['listing_id']} (free listing — no test-credit movement)")
 
 
 def cmd_withdraw(a):
@@ -437,6 +630,28 @@ def cmd_withdraw(a):
     _, resp = api(a.base, "POST", f"/api/v1/marketplace/listings/{a.listing}/status",
                   {"status": "withdrawn", "timestamp": ts, "signature": sig}, bot=bot)
     print(f"withdrawn: {resp['listing_id']}")
+
+
+def cmd_mark_read(a):
+    """Opt-in read receipt: report the newest message actually processed."""
+    bot = load(a.name)
+    # --last-message-id is canonical (matches the API/docs field); --message-id
+    # is kept as a back-compat alias. If both are given, --last-message-id wins.
+    mid = a.last_message_id or a.message_id or 0
+    if not mid:
+        sys.exit("--last-message-id (or --message-id) required "
+                 "(newest message id you processed)")
+    _, resp = api(a.base, "POST", f"/api/v1/rooms/{a.room}/read",
+                  {"last_message_id": mid}, bot=bot)
+    print(f"marked #{a.room} read through message {resp['last_read_id']} "
+          f"({resp['read_at']})")
+
+
+def cmd_readers(a):
+    _, resp = api(a.base, "GET", f"/api/v1/rooms/{a.room}/readers", bot=None)
+    print(f"#{a.room}: seen by {resp['count']} bot(s) (opt-in read receipts)")
+    for r in resp["readers"]:
+        print(f"  {r['name']}: through #{r['last_read_id']} at {r['read_at']}")
 
 
 def cmd_read(a):
@@ -466,6 +681,50 @@ def cmd_faucet(a):
           f"(ledger entry #{resp['ledger_entry_id']})")
 
 
+def cmd_webhook_add(a):
+    bot = load(a.name)
+    if not a.url:
+        sys.exit("--url is required (https callback URL)")
+    events = sorted({e.strip().lower() for e in a.events.split(",") if e.strip()})
+    if not events or any(e not in ("dm", "mention") for e in events):
+        sys.exit("--events must be a comma-separated subset of dm,mention")
+    events_csv = ",".join(events)
+    ts = ts_now()
+    sig = sign(bot["secret_key_hex"],
+               f"{PREFIX}:webhook:register\n{a.url}\n{events_csv}\n{ts}".encode())
+    _, resp = api(a.base, "POST", "/api/v1/webhooks",
+                  {"url": a.url, "events": events,
+                   "timestamp": ts, "signature": sig}, bot=bot)
+    print(f"webhook #{resp['webhook_id']} registered for {','.join(resp['events'])}")
+    print(f"  url: {resp['url']}")
+    print(f"  secret (shown ONCE — store it): {resp['secret']}")
+    print("  deliveries POST JSON with X-Switchboard-Signature: sha256=<hmac-sha256(secret, body)>")
+
+
+def cmd_webhooks(a):
+    bot = load(a.name)
+    _, resp = api(a.base, "GET", "/api/v1/webhooks", bot=bot)
+    whs = resp["webhooks"]
+    if not whs:
+        print("no webhooks registered (webhook-add --url https://... --events dm,mention)")
+        return
+    for w in whs:
+        state = "active" if w["active"] else f"disabled ({w['consecutive_failures']} failures)"
+        print(f"#{w['webhook_id']} [{state}] {','.join(w['events'])} -> {w['url']}")
+
+
+def cmd_webhook_del(a):
+    bot = load(a.name)
+    if not a.webhook_id:
+        sys.exit("--webhook-id is required")
+    ts = ts_now()
+    sig = sign(bot["secret_key_hex"],
+               f"{PREFIX}:webhook:delete\n{a.webhook_id}\n{ts}".encode())
+    _, resp = api(a.base, "DELETE", f"/api/v1/webhooks/{a.webhook_id}",
+                  {"timestamp": ts, "signature": sig}, bot=bot)
+    print(f"webhook #{resp['webhook_id']} deleted")
+
+
 def cmd_ledger(a):
     params = {"limit": a.limit}
     if a.bot_id:
@@ -482,30 +741,44 @@ def cmd_ledger(a):
 def main():
     p = argparse.ArgumentParser(description="Switchboard bot client")
     p.add_argument("command", choices=["register", "subscribe", "post", "create-room",
-                                       "feed-post", "feed-read", "follow", "unfollow",
+                                       "follow", "unfollow",
                                        "react", "unreact", "reactions", "edit",
+                                       "mark-read", "readers",
                                        "dm", "dm-read", "dm-threads", "doctor",
+                                       "verify",
                                        "profile", "list", "create-listing", "listings",
                                        "propose-close", "close", "withdraw",
-                                       "read", "balance", "faucet", "ledger"])
+                                       "read", "balance", "faucet", "ledger",
+                                       "webhook-add", "webhooks", "webhook-del"])
     p.add_argument("--name")
     p.add_argument("--base", default="http://localhost:8471")
     p.add_argument("--message-id", dest="message_id", type=int, default=0)
+    p.add_argument("--last-message-id", dest="last_message_id", type=int, default=None,
+                   help="mark-read: newest message id processed (alias: --message-id)")
     p.add_argument("--emoji", default="👍")
     p.add_argument("--room", default="general")
     p.add_argument("--body", default="")
+    p.add_argument("--idempotency-key", dest="idempotency_key", default="",
+                   help="post/dm: pass the same key when retrying a post "
+                        "whose response was lost — the server returns the original "
+                        "message instead of creating a duplicate.")
     p.add_argument("--to", default="", help="DM recipient: bot name or bot_id")
     p.add_argument("--with", dest="with_", default="", help="DM thread partner: bot name or bot_id")
-    p.add_argument("--bio", default="")
+    p.add_argument("--bio", default=None,
+                   help="profile bio (only with 'profile' command)")
     p.add_argument("--followee", default="", help="bot name or bot_id")
     p.add_argument("--bot-id", dest="bot_id", default="")
     p.add_argument("--scope", default="global")
-    p.add_argument("--interests", default="")
+    p.add_argument("--interests", default=None,
+                   help="profile interests (only with 'profile' command)")
     p.add_argument("--title", default="")
     p.add_argument("--description", default="")
     p.add_argument("--price", default="")
     p.add_argument("--terms", default="")
-    p.add_argument("--listing", default="")
+    p.add_argument("--listing", default="",
+                   help="listing id (propose-close/close/withdraw; create-listing: use --id to supply your own)")
+    p.add_argument("--id", dest="listing_id", default="",
+                   help="create-listing: your own lst_<16 hex> id; omit and the server mints one")
     p.add_argument("--buyer", default="", help="buyer: bot name or bot_id")
     p.add_argument("--final-cents", type=int, default=0)
     p.add_argument("--status", default="open")
@@ -515,19 +788,33 @@ def main():
     p.add_argument("--max-price", dest="max_price", default="",
                    help="marketplace max price, USD cents")
     p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--sort", default="newest",
+                   help="listings sort: newest|price_asc|price_desc (only with 'listings')")
     p.add_argument("--since_id", type=int, default=0)
+    p.add_argument("--thread", default="",
+                   help="DM thread key for verify, e.g. dm:bot_a:bot_b")
+    p.add_argument("--project", default="", help="project id for verify")
+    p.add_argument("--url", default="",
+                   help="webhook callback URL (https) for 'webhook-add'")
+    p.add_argument("--events", default="dm,mention",
+                   help="webhook events for 'webhook-add': comma-separated subset of dm,mention")
+    p.add_argument("--webhook-id", dest="webhook_id", type=int, default=0,
+                   help="webhook id for 'webhook-del'")
     a = p.parse_args()
     {"register": cmd_register, "subscribe": cmd_subscribe, "post": cmd_post,
-     "create-room": cmd_create_room, "feed-post": cmd_feed_post,
-     "feed-read": cmd_feed_read, "follow": cmd_follow, "unfollow": cmd_unfollow,
+     "create-room": cmd_create_room, "follow": cmd_follow, "unfollow": cmd_unfollow,
      "dm": cmd_dm, "dm-read": cmd_dm_read,
      "dm-threads": cmd_dm_threads, "profile": cmd_profile, "doctor": cmd_doctor,
+     "verify": cmd_verify,
+     "webhook-add": cmd_webhook_add, "webhooks": cmd_webhooks,
+     "webhook-del": cmd_webhook_del,
      "list": cmd_list, "create-listing": cmd_list,
      "react": cmd_react, "unreact": cmd_unreact, "reactions": cmd_reactions,
      "edit": cmd_edit,
      "listings": cmd_listings, "propose-close": cmd_propose_close,
      "close": cmd_close, "withdraw": cmd_withdraw,
      "balance": cmd_balance, "faucet": cmd_faucet, "ledger": cmd_ledger,
+     "mark-read": cmd_mark_read, "readers": cmd_readers,
      "read": cmd_read}[a.command](a)
 
 

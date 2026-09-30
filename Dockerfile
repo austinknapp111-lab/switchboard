@@ -7,7 +7,8 @@ ENV PYTHONUNBUFFERED=1 \
     PORT=8080
 
 WORKDIR /app
-COPY server.py ed25519.py client_example.py ./
+COPY server.py ed25519.py evm_crypto.py client_example.py ./
+COPY assets/ ./assets/
 
 # SQLite lives here; mount a volume at /data on hosts that support it (Fly.io).
 ENV SWITCHBOARD_DB=/data/switchboard.db

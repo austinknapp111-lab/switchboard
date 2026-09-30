@@ -5,7 +5,7 @@ Spins up throwaway server(s) with temp SQLite DBs and a fake Stripe in a
 thread, then proves end-to-end over HTTP:
 
   register / trial subscribe / profile+bio / follow+unfollow /
-  feed post + global + following + bot reads / group post + read /
+  feed endpoints removed -> 404 / group post + read /
   DM send + read (third bot locked out) / DM chain-verify auth /
   marketplace: listing create (double-verify fix), propose, complete,
   fee accrual, withdraw / forged signature -> 403 / unsubscribed marketplace
@@ -26,6 +26,8 @@ Run:  python3 tests/test_v1.py
 """
 import json
 import os
+import re
+import secrets
 import sqlite3
 import subprocess
 import sys
@@ -35,7 +37,7 @@ import time
 import urllib.parse
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -140,13 +142,6 @@ def post_room(bot, room, body, ts=None, send_body=None, sig=None):
     return req("POST", "/api/v1/messages",
                {"room": room, "body": send_body if send_body is not None else body,
                 "timestamp": ts, "signature": sig}, auth(bot))
-
-
-def post_feed(bot, body, ts=None):
-    ts = ts or now_ts()
-    sig = esign(bot, server.canonical_feed(body, ts))
-    return req("POST", "/api/v1/feed",
-               {"body": body, "timestamp": ts, "signature": sig}, auth(bot))
 
 
 def post_dm(bot, recipient_id, body, ts=None):
@@ -295,25 +290,24 @@ def phase1():
               rob["message_count"] == 0 and rob["participant_count"] == 0
               and rob["last_activity_at"] is None, str(rob))
 
-        # -- feed ------------------------------------------------
-        c, r = post_feed(A, "Alpha's first public update.")
-        check("A feed post -> 201", c == 201 and "hash" in r, f"{c} {r}")
-        c, r = req("GET", "/api/v1/feed?scope=global")
-        check("global feed public -> 1 post", c == 200 and len(r["posts"]) == 1,
-              str(r)[:200])
-        c, r = req("GET", "/api/v1/feed?scope=bot&bot_id=" + A["bot_id"])
-        check("bot feed read -> 1 post", c == 200 and len(r["posts"]) == 1,
-              str(r)[:200])
-        c, _ = req("GET", "/api/v1/feed?scope=following")
-        check("following feed unauthenticated -> 401", c == 401, str(c))
+        # -- feed removed (2026-09-29): endpoints gone ---------
+        c, _ = req("POST", "/api/v1/feed",
+                   {"body": "x", "timestamp": now_ts(), "signature": "00" * 64},
+                   auth(A))
+        check("POST /api/v1/feed -> 404 (removed)", c == 404, str(c))
+        c, _ = req("GET", "/api/v1/feed?scope=global")
+        check("GET /api/v1/feed -> 404 (removed)", c == 404, str(c))
+        c, _ = req("GET", "/feed")
+        check("GET /feed page -> 404 (removed)", c == 404, str(c))
+        # -- follows (kept) --------------------------------------
         c, r = req("POST", "/api/v1/follows", {"followee_id": A["bot_id"]}, auth(B))
         check("B follows A -> 201", c == 201, f"{c} {r}")
         c, _ = req("POST", "/api/v1/follows", {"followee_id": A["bot_id"]}, auth(B))
         check("duplicate follow -> 409", c == 409, str(c))
         c, _ = req("POST", "/api/v1/follows", {"followee_id": B["bot_id"]}, auth(B))
         check("self-follow -> 400", c == 400, str(c))
-        c, r = req("GET", "/api/v1/feed?scope=following", None, auth(B))
-        check("B following feed -> A's post", c == 200 and len(r["posts"]) == 1,
+        c, r = req("GET", "/api/v1/bots/" + A["bot_id"])
+        check("profile shows 1 follower", c == 200 and r["followers"] == 1,
               str(r)[:200])
         c, r = req("DELETE", "/api/v1/follows?followee_id=" + A["bot_id"],
                    None, auth(B))
@@ -413,6 +407,44 @@ def phase1():
         check("listing chain verifies", c == 200 and r.get("ok") is True,
               str(r)[:200])
 
+        # -- marketplace sort -----------------------------------
+        lid3 = "lst_" + os.urandom(8).hex()
+        c, _ = create_listing(A, lid3, "SortBot cheap widget",
+                              "a cheap widget", "$5")
+        check("sort test listing $5 -> 201", c == 201, str(c))
+        lid4 = "lst_" + os.urandom(8).hex()
+        c, _ = create_listing(A, lid4, "SortBot pricey widget",
+                              "a pricey widget", "$100")
+        check("sort test listing $100 -> 201", c == 201, str(c))
+        lid5 = "lst_" + os.urandom(8).hex()
+        c, _ = create_listing(A, lid5, "SortBot crypto widget",
+                              "crypto-priced widget", "0.2 ETH")
+        check("sort test listing 0.2 ETH -> 201", c == 201, str(c))
+        q3 = urllib.parse.quote("SortBot")
+        c, r = req("GET", "/api/v1/marketplace/listings"
+                          f"?q={q3}&sort=price_asc")
+        ids = [l["listing_id"] for l in r["listings"]] if c == 200 else []
+        check("sort=price_asc -> $5,$100,crypto", c == 200 and ids ==
+              [lid3, lid4, lid5], str(ids))
+        c, r = req("GET", "/api/v1/marketplace/listings"
+                          f"?q={q3}&sort=price_desc")
+        ids = [l["listing_id"] for l in r["listings"]] if c == 200 else []
+        check("sort=price_desc -> $100,$5,crypto (non-USD last)", c == 200
+              and ids == [lid4, lid3, lid5], str(ids))
+        c, r = req("GET", "/api/v1/marketplace/listings"
+                          f"?q={q3}&sort=newest")
+        ids = [l["listing_id"] for l in r["listings"]] if c == 200 else []
+        check("sort=newest explicit -> latest first", c == 200 and ids ==
+              [lid5, lid4, lid3], str(ids))
+        c, r = req("GET", "/api/v1/marketplace/listings"
+                          f"?q={q3}&sort=cheapest")
+        check("sort=cheapest -> 400", c == 400, f"{c} {r}")
+        c, r = req("GET", "/api/v1/marketplace/listings"
+                          f"?q={q3}&sort=price_asc&max_price=999")
+        check("sort+price filter combine -> only $5", c == 200 and
+              [l["listing_id"] for l in r["listings"]] == [lid3],
+              str([l["listing_id"] for l in r.get("listings", [])]))
+
         # -- forged / bad auth ----------------------------------
         c, _ = post_room(A, "general", "real body", send_body="forged body")
         check("tampered body, valid sig -> 403", c == 403, str(c))
@@ -421,6 +453,16 @@ def phase1():
                    {"room": "general", "body": "x", "timestamp": ts,
                     "signature": "ab" * 64}, auth(A))
         check("garbage signature -> 403", c == 403, str(c))
+        ts = now_ts()
+        c, r = req("POST", "/api/v1/messages",
+                   {"room": "general", "body": "sig-hint body", "timestamp": ts,
+                    "signature": "ab" * 64}, auth(A))
+        check("bad-sig 403 carries additive hint", c == 403 and "hint" in r,
+              str(r)[:160])
+        expect = server.canonical_room("general", "sig-hint body", ts).decode()
+        check("hint shows exact expected canonical bytes",
+              c == 403 and r.get("hint", "").endswith(expect),
+              str(r.get("hint"))[:120])
         c, _ = req("POST", "/api/v1/messages",
                    {"room": "general", "body": "x", "timestamp": ts,
                     "signature": "ab" * 64},
@@ -432,8 +474,10 @@ def phase1():
         _, E = register("echo-bot")  # never subscribed
         c, _ = post_room(E, "general", "no sub")
         check("unsubscribed room post -> 201 (posting free)", c == 201, str(c))
-        c, _ = post_feed(E, "no sub feed")
-        check("unsubscribed feed post -> 201 (posting free)", c == 201, str(c))
+        c, _ = req("POST", "/api/v1/feed",
+                   {"body": "x", "timestamp": now_ts(), "signature": "00" * 64},
+                   auth(E))
+        check("unsubscribed feed post -> 404 (removed)", c == 404, str(c))
         c, _ = post_dm(E, A["bot_id"], "no sub dm")
         check("unsubscribed DM -> 201 (DMs free)", c == 201, str(c))
         c, _ = req("POST", "/api/v1/follows", {"followee_id": A["bot_id"]},
@@ -636,7 +680,7 @@ def phase2():
 
 
 def phase3():
-    """Backward pagination: `before` cursor on feed, room messages, DM reads."""
+    """Backward pagination: `before` cursor on room messages, DM reads."""
     global BASE
     db = tempfile.mktemp(prefix="sb-test3-", suffix=".db")
     proc = start_server(8125, db)
@@ -644,9 +688,6 @@ def phase3():
         _, A = register("pag-alpha")
         _, B = register("pag-beta")
         subscribe(A); subscribe(B)
-        for i in range(5):
-            c, _ = post_feed(A, f"feed post {i}")
-            assert c == 201, f"feed post {i}: {c}"
         c, r = req("POST", "/api/v1/rooms", {"name": "pagroom"}, auth(A))
         assert c == 201, (c, r)
         for i in range(5):
@@ -656,26 +697,9 @@ def phase3():
             c, _ = post_dm(A, B["bot_id"], f"dm {i}")
             assert c == 201, f"dm {i}: {c}"
 
-        # -- feed: newest-first pages --------------------------------
-        c, r = req("GET", "/api/v1/feed?scope=global&limit=2")
-        assert c == 200 and len(r["posts"]) == 2, str(r)[:200]
-        ids_p1 = [p["id"] for p in r["posts"]]
-        check("feed limit=2 -> 2 newest", ids_p1 == sorted(ids_p1, reverse=True))
-        c, r = req("GET", f"/api/v1/feed?scope=global&limit=2&before={min(ids_p1)}")
-        ids_p2 = [p["id"] for p in r["posts"]]
-        check("feed before=min -> next 2 older",
-              c == 200 and len(ids_p2) == 2 and max(ids_p2) < min(ids_p1),
-              str(r)[:200])
-        c, r = req("GET", f"/api/v1/feed?scope=global&limit=5&before={min(ids_p2)}")
-        check("feed before pages to the end",
-              c == 200 and len(r["posts"]) == 1 and r["posts"][0]["id"] < min(ids_p2),
-              str(r)[:200])
-        c, r = req("GET", "/api/v1/feed?scope=global&before=abc")
-        check("feed before=abc -> 400", c == 400, str(r)[:120])
-        c, r = req("GET", f"/api/v1/feed?scope=global&since_id={min(ids_p2)}&before={min(ids_p1)}")
-        check("feed since_id+before window",
-              c == 200 and len(r["posts"]) == 1 and r["posts"][0]["id"] == 3,
-              str(r)[:200])
+        # -- feed removed: endpoints 404 ------------------------------
+        c, _ = req("GET", "/api/v1/feed?scope=global&limit=2")
+        check("feed global -> 404 (removed)", c == 404, str(c))
 
         # -- room messages (oldest-first order preserved) -------------
         c, r = req("GET", "/api/v1/messages?room=pagroom&limit=2")
@@ -688,6 +712,32 @@ def phase3():
               str(r)[:200])
         c, r = req("GET", "/api/v1/messages?room=pagroom&before=abc")
         check("room before=abc -> 400", c == 400, str(r)[:120])
+
+        # -- room page: date dividers --------------------------------
+        old_ts = (datetime.now(timezone.utc)
+                  - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        old_label = (datetime.now(timezone.utc) - timedelta(days=3)
+                     ).strftime("%b %-d, %Y").replace(" 0", " ")
+        con = sqlite3.connect(db)
+        con.execute(
+            """UPDATE messages SET client_timestamp=?, created_at=?
+               WHERE id=(SELECT MIN(id) FROM messages WHERE scope='pagroom')""",
+            (old_ts, old_ts))
+        con.commit()
+        con.close()
+        with urllib.request.urlopen(BASE + "/room/pagroom",
+                                    timeout=15) as resp:
+            room_html = resp.read().decode()
+        divs = room_html.count('class="date-div"')
+        check("room page has 2 date dividers (Today + older day)", divs == 2,
+              f"divs={divs}")
+        check("room page Today divider present",
+              '<span>Today</span>' in room_html)
+        check("room page older-day divider labeled",
+              f"<span>{old_label}</span>" in room_html, old_label)
+        check("room page newest-first: Today divider precedes older divider",
+              room_html.index('<span>Today</span>')
+              < room_html.index(f"<span>{old_label}</span>"))
 
         # -- DM reads: before doesn't regress the monotone read mark -
         c, r = req("GET", f"/api/v1/dm?with={A['bot_id']}&limit=2", None, auth(B))
@@ -757,14 +807,14 @@ def phase4():
               c == 200 and mine is not None
               and mine.get("reaction_counts", {}).get("❤️") == 1,
               str(r)[:200])
-        c, r = post_feed(A, "feed with reactions")
+        c, r = post_room(A, "general", "room post with reactions")
         assert c == 201, (c, r)
         c2, r2 = react(C, r["id"], "🚀")
-        check("react on feed post -> 200", c2 == 200, f"{c2} {r2}")
-        c, r = req("GET", "/api/v1/feed?scope=global&limit=5")
-        fp = next((p for p in r["posts"] if p.get("reaction_counts", {}).get("🚀") == 1),
+        check("react on room post -> 200", c2 == 200, f"{c2} {r2}")
+        c, r = req("GET", "/api/v1/messages?room=general&limit=5")
+        fp = next((p for p in r["messages"] if p.get("reaction_counts", {}).get("🚀") == 1),
                   None)
-        check("feed read carries reaction_counts", fp is not None)
+        check("room read carries reaction_counts", fp is not None)
 
         # -- validation ---------------------------------------------
         c, r = react(B, mid, "not-an-emoji")
@@ -815,11 +865,11 @@ def phase4():
               f"{c} {r}")
 
         # -- unreact ------------------------------------------------
-        c, r = react(C, dmid, "👍")  # C is not in this thread; use feed post
+        c, r = react(C, dmid, "👍")  # C is not in this thread
         check("react on DM (non-participant, C) still -> 404", c == 404, f"{c} {r}")
         c, r = req("DELETE", f"/api/v1/messages/{mid}/reactions", None, auth(B))
         check("unreact on hidden message -> 404", c == 404, f"{c} {r}")
-        c, fp = post_feed(A, "unreact target")
+        c, fp = post_room(A, "general", "unreact target")
         assert c == 201, (c, fp)
         fmid = fp["id"]
         c, r = react(C, fmid, "🔥")
@@ -893,16 +943,16 @@ def phase5():
         rm = next(x for x in r["rooms"] if x["name"] == "general")
         check("message_count excludes edit rows", rm["message_count"] == 2, str(rm))
 
-        # -- feed + dm edits ---------------------------------------------
-        c, r = post_feed(A, "feed original")
+        # -- room + dm edits ---------------------------------------------
+        c, r = post_room(A, "general", "room original for edit")
         assert c == 201, (c, r)
         fmid = r["id"]
-        c, r = edit(A, fmid, "feed edited")
+        c, r = edit(A, fmid, "room edited")
         assert c == 200, (c, r)
-        c, r = req("GET", "/api/v1/feed?scope=global&limit=5")
-        fp = next((p for p in r["posts"] if p["id"] == fmid), None)
-        check("feed read overlays edit",
-              fp is not None and fp["body"] == "feed edited"
+        c, r = req("GET", "/api/v1/messages?room=general&limit=5")
+        fp = next((p for p in r["messages"] if p["id"] == fmid), None)
+        check("room read overlays edit",
+              fp is not None and fp["body"] == "room edited"
               and fp.get("edited") is True, str(r)[:200])
         c, r = post_dm(A, B["bot_id"], "dm original")
         assert c == 201, (c, r)
@@ -922,8 +972,12 @@ def phase5():
                    auth(B))
         check("react to edit event id -> 404", c == 404, f"{c} {r}")
         c, r = req("GET", "/api/v1/messages?room=general&limit=50")
-        check("edit rows never render as messages",
-              all(m["id"] != edit_id for m in r["messages"]))
+        hits = [m for m in r["messages"] if m["id"] == edit_id]
+        check("edit rows render only as tombstones, never as messages",
+              len(hits) == 1 and hits[0].get("kind") == "tombstone"
+              and hits[0].get("tombstone_for") == "edit"
+              and "body" not in hits[0] and "signature" not in hits[0]
+              and "bot_id" not in hits[0], str(hits)[:300])
 
         # -- auth / guards ------------------------------------------------
         c, r = edit(B, mid, "hijack attempt")
@@ -938,7 +992,7 @@ def phase5():
         c, r = edit(C, fmid, "no sub edit")
         check("edit someone else's message (unsubscribed) -> 403", c == 403,
               f"{c} {r}")
-        c, r = post_feed(C, "c's own post")
+        c, r = post_room(C, "general", "c's own post")
         assert c == 201, (c, r)
         c, r = edit(C, r["id"], "c edits own post")
         check("unsubscribed bot edits own message -> 200", c == 200,
@@ -964,12 +1018,234 @@ def phase5():
         proc.terminate()
 
 
+def phase6():
+    """Bot directory sorts: newest|oldest|most_followed|most_deals on
+    GET /api/v1/bots and the /bots HTML page. No ?sort= keeps the
+    historical order (created_at ASC); bad values -> 400 on the API and a
+    silent default render on the HTML page."""
+    global BASE
+    db = tempfile.mktemp(prefix="sb-test6-", suffix=".db")
+    proc = start_server(8129, db)
+    try:
+        c, A = register("sort-alpha")
+        assert c == 201, (c, A)
+        c, B = register("sort-beta")
+        assert c == 201, (c, B)
+        c, C = register("sort-gamma")
+        assert c == 201, (c, C)
+        c, D = register("sort-delta-buyer")
+        assert c == 201, (c, D)
+        for b in (A, B, C, D):
+            subscribe(b)
+
+        # follows: B has 2 followers (A, C); A has 1 (C); C has 0
+        for follower, followee in ((A, B), (C, B), (C, A)):
+            c, r = req("POST", "/api/v1/follows",
+                       {"followee_id": followee["bot_id"]}, auth(follower))
+            assert c == 201, (c, r)
+
+        # $0 deals: A completes 2 (as seller), B completes 1, C none.
+        # D is a throwaway buyer so only seller-side counts differ.
+        def close_zero_deal(seller, buyer):
+            L = "lst_" + secrets.token_hex(8)
+            ts = now_ts()
+            sig = esign(seller, server.canonical_listing_create(
+                L, "sort data", "desc", "$0.00", "", ts))
+            c, r = req("POST", "/api/v1/marketplace/listings",
+                       {"listing_id": L, "title": "sort data",
+                        "description": "desc", "price": "$0.00", "terms": "",
+                        "timestamp": ts, "signature": sig}, auth(seller))
+            assert c == 201, (c, r)
+            for event, signer in (
+                    ("propose-completion", seller),
+                    ("completed", buyer)):
+                c, d = req("GET", f"/api/v1/marketplace/listings/{L}")
+                if event == "propose-completion":
+                    payload = {"buyer_id": buyer["bot_id"],
+                               "final_price_cents": 0, "currency": "USD"}
+                else:
+                    payload = {"buyer_id": buyer["bot_id"],
+                               "final_price_cents": d.get(
+                                   "pending_final_price_cents", 0),
+                               "currency": d.get("currency", "USD")}
+                t2 = now_ts()
+                pj = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+                s2 = esign(signer, server.canonical_listing_event(
+                    L, event, pj, t2))
+                c, r = req(
+                    "POST",
+                    f"/api/v1/marketplace/listings/{L}/"
+                    + ("propose-completion" if event == "propose-completion"
+                       else "complete"),
+                    {**(payload if event == "propose-completion" else {}),
+                     "timestamp": t2, "signature": s2}, auth(signer))
+                assert c in (200, 201), (event, c, r)
+
+        close_zero_deal(A, D)
+        close_zero_deal(A, D)
+        close_zero_deal(B, D)
+
+        def order(qs=""):
+            c, r = req("GET", "/api/v1/bots" + qs)
+            assert c == 200, (c, r)
+            return [b["bot_id"] for b in r["bots"]]
+
+        ids = {k: v["bot_id"] for k, v in
+               (("A", A), ("B", B), ("C", C), ("D", D))}
+        c, r = req("GET", "/api/v1/bots")
+        check("default order = historical (created_at ASC)",
+              [b["bot_id"] for b in r["bots"]] == [ids["A"], ids["B"], ids["C"],
+                                                  ids["D"]],
+              str([b["name"] for b in r["bots"]]))
+        check("sort=newest", order("?sort=newest") ==
+              [ids["D"], ids["C"], ids["B"], ids["A"]], str(order("?sort=newest")))
+        check("sort=oldest", order("?sort=oldest") ==
+              [ids["A"], ids["B"], ids["C"], ids["D"]], str(order("?sort=oldest")))
+        got = order("?sort=most_followed")
+        check("sort=most_followed (B:2, A:1, C:0)",
+              got.index(ids["B"]) < got.index(ids["A"])
+              < got.index(ids["C"]) and got.index(ids["C"]) == 3,
+              str(got))
+        got = order("?sort=most_deals")
+        check("sort=most_deals (A:2, B:1, C:0; D excluded from order)",
+              [x for x in got if x in (ids["A"], ids["B"], ids["C"])] ==
+              [ids["A"], ids["B"], ids["C"]], str(got))
+        check("most_followed deterministic across reads",
+              order("?sort=most_followed") == order("?sort=most_followed"))
+        c, r = req("GET", "/api/v1/bots?sort=bogus")
+        check("bad sort -> 400", c == 400 and "bad sort" in str(r), f"{c} {r}")
+        c, r = req("GET", "/api/v1/bots?sort=NEWEST")
+        check("sort value case-insensitive",
+              c == 200 and [b["bot_id"] for b in r["bots"]] ==
+              order("?sort=newest"), f"{c}")
+        # followers/completed_deals fields still present on each bot
+        c, r = req("GET", "/api/v1/bots?sort=most_followed")
+        mb = next(b for b in r["bots"] if b["bot_id"] == ids["B"])
+        check("sort keeps full bot shape",
+              mb["followers"] == 2 and mb["completed_deals"] >= 1
+              and "message_count" in mb, str(mb)[:200])
+
+        # HTML page mirrors the API order and renders sort links
+        def page(qs=""):
+            r = urllib.request.Request(BASE + "/bots" + qs, method="GET")
+            with urllib.request.urlopen(r, timeout=15) as resp:
+                return resp.status, resp.read().decode()
+        c, h = page()
+        check("/bots -> 200 with sort links", c == 200 and "sort: " in h
+              and "?sort=most_followed" in h and "?sort=most_deals" in h,
+              f"{c} {str(h)[:100]}")
+        c, h = page("?sort=most_followed")
+        ia, ib, ic = h.index("sort-alpha"), h.index("sort-beta"), h.index("sort-gamma")
+        check("/bots?sort=most_followed renders B before A before C",
+              ib < ia < ic, f"{ia} {ib} {ic}")
+        c, h = page("?sort=newest")
+        ia, ib, ic = h.index("sort-alpha"), h.index("sort-beta"), h.index("sort-gamma")
+        check("/bots?sort=newest renders newest first (C)",
+              ic < ib < ia, f"{ia} {ib} {ic}")
+        c, h = page("?sort=bogus")
+        check("/bots?sort=bogus falls back to default render",
+              c == 200 and "sort-alpha" in h, f"{c}")
+        c, h = page("?sort=most_deals")
+        ia, ib, ic = h.index("sort-alpha"), h.index("sort-beta"), h.index("sort-gamma")
+        check("/bots?sort=most_deals renders A before B before C",
+              ia < ib < ic, f"{ia} {ib} {ic}")
+    finally:
+        proc.terminate()
+
+
+def phase7():
+    """Homepage 'view all' links per section + /messages (network-wide recent
+    room messages, newest-first, ?before=<id> backward pagination) +
+    /marketplace?filter=completed pre-selects the Completed chip.
+    Moderation semantics: hidden messages never render on /messages."""
+    global BASE
+    db = tempfile.mktemp(prefix="sb-test7-", suffix=".db")
+    proc = start_server(8130, db)
+    try:
+        c, A = register("viewall-alpha")
+        assert c == 201, (c, A)
+        c, B = register("viewall-beta")
+        assert c == 201, (c, B)
+        # A: 1 hidden + 25 visible (26 posts, under the 30/hr quota)
+        c, r = post_room(A, "general", "secret-hidden-msg")
+        assert c == 201, (c, r)
+        hid = r["id"]
+        for i in range(1, 26):
+            c, r = post_room(A, "general", f"pg-a-{i}")
+            assert c == 201, (c, r)
+        # B: 26 visible
+        for i in range(26):
+            c, r = post_room(B, "general", f"pg-b-{i}")
+            assert c == 201, (c, r)
+        c, r = req("POST", f"/api/v1/admin/messages/{hid}/hide",
+                   {"reason": "test hide"}, ADM)
+        assert c == 200, (c, r)
+
+        def page(path):
+            rq = urllib.request.Request(BASE + path, method="GET")
+            with urllib.request.urlopen(rq, timeout=15) as resp:
+                return resp.status, resp.read().decode()
+
+        # homepage section headers carry view-all links
+        c, h = page("/")
+        check("homepage view-all -> /messages",
+              c == 200 and 'href="/messages"' in h and "view all →" in h,
+              f"{c}")
+        check("homepage view-all -> /marketplace?filter=completed",
+              'href="/marketplace?filter=completed"' in h, f"{c}")
+        check("homepage view-all -> /projects",
+              'href="/projects"' in h, f"{c}")
+
+        # /messages: newest first, hidden never rendered
+        c, h = page("/messages")
+        check("/messages -> 200", c == 200, f"{c}")
+        check("/messages renders newest first",
+              all(f"pg-b-{i}" in h for i in (25, 24, 23))
+              and h.index("pg-b-25") < h.index("pg-b-24")
+              < h.index("pg-b-23"), f"{c} {h[:120]}")
+        check("/messages shows room chips", "#general" in h)
+        check("/messages never renders hidden message",
+              "secret-hidden-msg" not in h)
+        # 51 visible messages -> page 1 has 50 + older link
+        check("/messages page 1 has older link",
+              "/messages?before=" in h, f"{c}")
+        m = re.search(r'/messages\?before=(\d+)', h)
+        assert m, "no older link found"
+        c2, h2 = page("/messages?before=" + m.group(1))
+        check("older page -> 200 with oldest visible message",
+              c2 == 200 and "pg-a-1" in h2
+              and "← newest" in h2, f"{c2}")
+        check("older page excludes already-seen messages",
+              "pg-b-25" not in h2 and "pg-a-25" not in h2)
+        # bad before= falls back to the newest page
+        c3, h3 = page("/messages?before=bogus")
+        check("/messages?before=bogus falls back to newest",
+              c3 == 200 and "pg-b-25" in h3, f"{c3}")
+
+        # marketplace filter pre-select
+        c, h = page("/marketplace")
+        check("/marketplace defaults to All chip",
+              c == 200 and 'id="mchip-all" class="btn primary"' in h
+              and 'id="mchip-completed" class="btn"' in h, f"{c}")
+        c, h = page("/marketplace?filter=completed")
+        check("/marketplace?filter=completed pre-selects Completed chip",
+              c == 200 and 'id="mchip-completed" class="btn primary"' in h
+              and 'mfilter("completed",b)' in h, f"{c}")
+        c, h = page("/marketplace?filter=bogus")
+        check("/marketplace?filter=bogus falls back to All",
+              c == 200 and 'id="mchip-all" class="btn primary"' in h, f"{c}")
+    finally:
+        proc.terminate()
+
+
 def main():
     phase1()
     phase2()
     phase3()
     phase4()
     phase5()
+    phase6()
+    phase7()
     print()
     print(f"{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:

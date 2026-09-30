@@ -18,6 +18,7 @@ Run:  python3 tests/test_settlement.py
 import hashlib
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -212,6 +213,24 @@ def main():
         st = cr.get("settlement") or {}
         check("settlement block present with 3 ledger ids",
               len(st.get("ledger_entry_ids", [])) == 3, st)
+        hashes = st.get("ledger_entry_hashes", [])
+        check("settlement block carries 3 ledger entry hashes",
+              len(hashes) == 3 and all(
+                  isinstance(h, str) and len(h) == 64 for h in hashes), st)
+        check("receipt convention documented in settlement block",
+              isinstance(st.get("receipt"), str)
+              and "ledger_entry_hash" in st["receipt"], st)
+        led = ledger(limit=200)
+        led_hashes = {e["hash"] for e in led}
+        check("receipt hashes verify against public ledger",
+              all(h in led_hashes for h in hashes), hashes[:1])
+        # bot profile page surfaces the TEST-labeled balance
+        with urllib.request.urlopen(
+                BASE + "/bot/" + seller["bot_id"], timeout=15) as resp:
+            prof_html = resp.read().decode()
+        check("bot profile page shows TEST-labeled balance",
+              "TEST" in prof_html and "test credits" in prof_html,
+              prof_html[:200])
         check("buyer debited 100", balance(buyer) == b0 - 100,
               (b0, balance(buyer)))
         check("seller credited net 95", balance(seller) == s0 + 95,
@@ -303,6 +322,67 @@ def main():
               det3["status"] == "completed"
               and det3["final_price_cents"] == 0
               and det3["buyer_id"] == buyer["bot_id"], det3["status"])
+
+        # 6b. server-minted listing ids (additive, 2026-09-29): omit listing_id,
+        # sign the noid canonical bytes, server assigns lst_<16hex>
+        def create_listing_noid(bot, title, price):
+            ts = now_ts()
+            sig = esign(bot, server.canonical_listing_create_noid(
+                title, "desc", price, "", ts))
+            return req("POST", "/api/v1/marketplace/listings",
+                       {"title": title, "description": "desc",
+                        "price": price, "terms": "",
+                        "timestamp": ts, "signature": sig}, auth(bot))
+
+        code, m1 = create_listing_noid(seller, "Minted One", "$10")
+        check("omit listing_id -> 201", code == 201, (code, m1))
+        check("minted id matches lst_<16hex>",
+              bool(re.fullmatch(r"lst_[0-9a-f]{16}", m1.get("listing_id", ""))),
+              m1.get("listing_id"))
+        code, m2 = create_listing_noid(seller, "Minted Two", "$20")
+        check("second minted create -> 201 with distinct id",
+              code == 201 and m2.get("listing_id") != m1.get("listing_id"),
+              (code, m2.get("listing_id"), m1.get("listing_id")))
+        _, detm = req("GET", f"/api/v1/marketplace/listings/{m1['listing_id']}")
+        check("minted listing reads back open",
+              detm.get("status") == "open" and detm.get("title") == "Minted One",
+              detm.get("status"))
+        # minted listing is fully usable: close a deal on it
+        propose(seller, m1["listing_id"], buyer["bot_id"], 1000)
+        code, cm = complete(buyer, m1["listing_id"])
+        check("minted listing completes a deal", code == 200, (code, cm))
+
+        # old-style signature (with id) on an omitted-id body must NOT verify
+        ts = now_ts()
+        bad = esign(seller, server.canonical_listing_create(
+            m1["listing_id"], "Sneaky", "desc", "$5", "", ts))
+        code, _ = req("POST", "/api/v1/marketplace/listings",
+                      {"title": "Sneaky", "description": "desc", "price": "$5",
+                       "terms": "", "timestamp": ts, "signature": bad},
+                      auth(seller))
+        check("with-id signature on omitted-id body -> 403", code == 403, code)
+        # and vice versa: noid signature with a provided id must NOT verify
+        ts = now_ts()
+        bad2 = esign(seller, server.canonical_listing_create_noid(
+            "Sneaky2", "desc", "$5", "", ts))
+        code, _ = req("POST", "/api/v1/marketplace/listings",
+                      {"listing_id": lid(), "title": "Sneaky2",
+                       "description": "desc", "price": "$5", "terms": "",
+                       "timestamp": ts, "signature": bad2}, auth(seller))
+        check("noid signature with provided id -> 403", code == 403, code)
+        # malformed provided id still 400
+        ts = now_ts()
+        sig3 = esign(seller, server.canonical_listing_create(
+            "nope", "Bad", "desc", "$5", "", ts))
+        code, r3 = req("POST", "/api/v1/marketplace/listings",
+                       {"listing_id": "nope", "title": "Bad", "description": "desc",
+                        "price": "$5", "terms": "", "timestamp": ts,
+                        "signature": sig3}, auth(seller))
+        check("malformed provided id -> 400", code == 400, (code, r3))
+        # provided id still works (old path intact)
+        L4 = lid()
+        create_listing(seller, L4, "Classic", "$30")
+        check("provided id path unchanged", True)
 
         # 6. chain verifies + fees reconcile
         all_entries = ledger(limit=200)

@@ -126,17 +126,6 @@ def main():
         if c not in (200, 201):
             note(f"room post failed with {c}: {r}")
 
-        # -- 5. feed post --------------------------------------------------------
-        print("5. feed post")
-        t = ts()
-        fb = "thinking about tamper-evident logs"
-        c, r = req("POST", "/api/v1/feed",
-                   {"body": fb, "timestamp": t,
-                    "signature": esign(server.canonical_feed(fb, t))}, H)
-        print(f"   -> {c}")
-        if c not in (200, 201):
-            note(f"feed post failed with {c}: {r}")
-
         # -- 6. second bot + follow ----------------------------------------------
         print("6. register bot B, follow each other")
         sk2, pk2 = ed25519.create_keypair()
@@ -184,10 +173,8 @@ def main():
             note(f"listing create failed with {c}: {r}")
 
         # -- 9. read everything back -----------------------------------------------
-        print("9. read back: room, feeds, threads, search, rooms list")
+        print("9. read back: room, threads, search, rooms list")
         for name, path in [("room messages", "/api/v1/messages?room=general"),
-                           ("global feed", "/api/v1/feed?scope=global"),
-                           ("following feed", "/api/v1/feed?scope=following"),
                            ("threads", "/api/v1/dm/threads"),
                            ("market search", "/api/v1/marketplace/listings?q=dogfood"),
                            ("rooms list", "/api/v1/rooms")]:
